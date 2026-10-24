@@ -1,0 +1,27 @@
+# CMake build files
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Visual Studio files
+.vs/
+*.suo
+*.user
+*.vcxproj
+*.vcxproj.filters
+*.sln
+
+# Compiled binaries
+*.exe
+*.out
+*.obj
+*.o
+*.dll
+*.lib
+
+# Local database files
+data/*.db
+data/*.db-journal
