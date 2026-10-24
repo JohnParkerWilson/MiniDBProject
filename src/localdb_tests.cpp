@@ -50,6 +50,54 @@ int main() {
 
     Bitmap empty_bitmap(0);
     assert(!empty_bitmap.find_first_zero(0).has_value());
+    expect_error([&] { empty_bitmap.find_first_zero(1); },
+                 ErrorCode::InvalidArgument);
+
+    Bitmap padded_bitmap(65);
+    for (std::size_t index = 0; index < padded_bitmap.size(); ++index) {
+        padded_bitmap.set(index);
+    }
+    // The remaining 63 storage bits are padding and must not be reported.
+    assert(!padded_bitmap.find_first_zero(0).has_value());
+
+    for (const std::size_t length : {std::size_t{1}, std::size_t{63},
+                                     std::size_t{64}, std::size_t{65}}) {
+        Bitmap boundary_bitmap(length);
+        assert(boundary_bitmap.find_first_zero(0).value() == 0);
+
+        const std::size_t last = length - 1;
+        assert(!boundary_bitmap.set(last));
+        assert(boundary_bitmap.set(last));
+        assert(boundary_bitmap.get(last));
+        assert(boundary_bitmap.clear(last));
+        assert(!boundary_bitmap.clear(last));
+        assert(boundary_bitmap.find_first_zero(0).value() == 0);
+
+        // Fill the logical range and verify that padding, if any, is ignored.
+        for (std::size_t index = 0; index < length; ++index) {
+            boundary_bitmap.set(index);
+        }
+        assert(!boundary_bitmap.find_first_zero(0).has_value());
+
+        // Repeated updates must preserve the previous-value contract.
+        assert(boundary_bitmap.clear(0));
+        assert(!boundary_bitmap.clear(0));
+        assert(boundary_bitmap.find_first_zero(last).value() == 0);
+        assert(!boundary_bitmap.set(0));
+        assert(boundary_bitmap.set(0));
+        assert(!boundary_bitmap.find_first_zero(0).has_value());
+    }
+
+    Bitmap word_boundary_bitmap(65);
+    assert(!word_boundary_bitmap.set(63));
+    assert(!word_boundary_bitmap.set(64));
+    assert(word_boundary_bitmap.get(63));
+    assert(word_boundary_bitmap.get(64));
+    assert(word_boundary_bitmap.find_first_zero(63).value() == 0);
+    assert(word_boundary_bitmap.clear(63));
+    assert(word_boundary_bitmap.find_first_zero(63).value() == 63);
+    word_boundary_bitmap.set(63);
+    assert(word_boundary_bitmap.find_first_zero(64).value() == 0);
 
     const Schema schema({
         Column("id", TypeId::Int32),

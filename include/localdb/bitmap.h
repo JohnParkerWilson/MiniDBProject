@@ -24,6 +24,9 @@ public:
 
     // Searches [start, size), then [0, start). Returns nullopt if every
     // logical bit is set. For a non-empty bitmap, start must be in range.
+    // The search scans uint64_t words rather than testing every bit. Its
+    // complexity is O(number of storage words + 64), or O(ceil(n / 64))
+    // for a bitmap with n logical bits.
     std::optional<std::size_t> find_first_zero(std::size_t start) const;
 
 private:

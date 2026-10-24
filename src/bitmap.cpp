@@ -8,6 +8,9 @@ Bitmap::Bitmap(std::size_t bit_count)
     : bit_count_(bit_count),
       words_(bit_count / kWordBits + (bit_count % kWordBits == 0 ? 0 : 1), 0) {}
 
+// Logical bit i is stored in words_[i / 64], at bit position i % 64.
+// Bit position zero is the least-significant bit of each uint64_t word.
+
 void Bitmap::check_index(std::size_t index) const {
     if (index >= bit_count_) {
         throw DatabaseError(ErrorCode::InvalidArgument,
@@ -91,6 +94,10 @@ std::optional<std::size_t> Bitmap::find_zero_in_range(
 
 std::optional<std::size_t> Bitmap::find_first_zero(std::size_t start) const {
     if (bit_count_ == 0) {
+        if (start != 0) {
+            throw DatabaseError(ErrorCode::InvalidArgument,
+                                "Bitmap search hint is out of range");
+        }
         return std::nullopt;
     }
     check_index(start);

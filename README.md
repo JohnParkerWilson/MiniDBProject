@@ -20,6 +20,7 @@ ctest --test-dir build --output-on-failure
 - `DiskManager` reads and writes fixed-size 4096-byte pages in a local binary file.
 - `Catalog` persists table IDs, table names, schemas, and the next table ID in a companion catalog file.
 - `DiskManager` creates and opens tables, allocates logical pages, maps them to initialized physical pages, reads and writes pages, synchronizes, and closes the database.
+- `Bitmap` stores logical bits in 64-bit words and supports bit updates plus circular first-zero searches.
 
 The tuple format is deliberately schema-aware and currently does not support SQL `NULL` values. The null flag is reserved in the encoding so null support can be added without changing the overall field framing. `String32` is a fixed-width field occupying 32 bytes; shorter values are zero-padded and longer values are rejected.
 
@@ -43,6 +44,19 @@ repeated table entries:
 ```
 
 `Catalog::create_table()` writes the catalog immediately through a temporary file and replacement, so table IDs and schemas survive process shutdown and can be recovered by constructing `Catalog` with the same path.
+
+## Bitmap representation and search complexity
+
+The bitmap stores bits in a vector of `uint64_t` words. Logical bit `i` maps to:
+
+```text
+word index  = i / 64
+bit position = i % 64
+```
+
+Bit position zero is the least-significant bit of its word. A bitmap with `n` logical bits uses `ceil(n / 64)` words. Unused bits in the final word are padding and are masked out of all searches.
+
+`find_first_zero(start)` scans complete words where possible, searches the range from `start` to the end, and then wraps to the beginning. Its complexity is `O(ceil(n / 64) + 64)`, conventionally written as `O(ceil(n / 64))`, because the extra scan within one word is bounded by 64 bits.
 
 The disk layer uses a companion catalog file by default. For a database path `data/localdb.db`, the catalog path is `data/localdb.db.catalog`. Each table entry also stores the physical page IDs belonging to that table. Logical page numbers are assigned from zero per table and remain stable after reopening.
 
