@@ -5,9 +5,16 @@
 namespace localdb {
 
 Schema::Schema(std::vector<Column> columns) : columns_(std::move(columns)) {
-    for (const auto& column : columns_) {
+    for (std::size_t i = 0; i < columns_.size(); ++i) {
+        const auto& column = columns_[i];
         if (column.name.empty()) {
             throw DatabaseError(ErrorCode::InvalidSchema, "Column name cannot be empty");
+        }
+        for (std::size_t previous = 0; previous < i; ++previous) {
+            if (columns_[previous].name == column.name) {
+                throw DatabaseError(ErrorCode::InvalidSchema,
+                                    "Column names must be unique");
+            }
         }
     }
 }

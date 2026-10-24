@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <unordered_set>
 
 namespace localdb {
 
@@ -11,6 +12,7 @@ DiskManager::DiskManager(const std::filesystem::path& path,
       catalog_(catalog_path.empty() ? std::filesystem::path(path.string() + ".catalog")
                                     : std::move(catalog_path)) {
     open_or_create();
+    validate_catalog_mappings();
 }
 
 DiskManager::~DiskManager() {
@@ -27,6 +29,21 @@ DiskManager::~DiskManager() {
 void DiskManager::ensure_open() const {
     if (closed_ || !file_.is_open()) {
         throw DatabaseError(ErrorCode::IoError, "Database is closed");
+    }
+}
+
+void DiskManager::validate_catalog_mappings() const {
+    const auto physical_count = physical_page_count();
+    std::unordered_set<DiskPageId> mapped_pages;
+    for (const auto& table_info : catalog_.tables()) {
+        for (const auto physical_page_id : table_info.physical_pages) {
+            if (physical_page_id >= physical_count ||
+                !mapped_pages.insert(physical_page_id).second) {
+                throw DatabaseError(
+                    ErrorCode::Corruption,
+                    "Catalog contains an invalid or duplicated physical page mapping");
+            }
+        }
     }
 }
 
@@ -104,8 +121,9 @@ void DiskManager::read_physical_page(DiskPageId page_id,
     file_.clear();
     file_.seekg(offset_for(page_id));
     file_.read(reinterpret_cast<char*>(page.data()), static_cast<std::streamsize>(kPageSize));
-    if (!file_) {
-        throw DatabaseError(ErrorCode::IoError, "Unable to read database page");
+    if (!file_ || file_.gcount() != static_cast<std::streamsize>(kPageSize)) {
+        throw DatabaseError(ErrorCode::IoError,
+                            "Short read while reading database page");
     }
 }
 
@@ -122,9 +140,25 @@ void DiskManager::write_physical_page(
     file_.seekp(offset_for(page_id));
     file_.write(reinterpret_cast<const char*>(page.data()), static_cast<std::streamsize>(page.size()));
     if (!file_) {
-        throw DatabaseError(ErrorCode::IoError, "Unable to write database page");
+        throw DatabaseError(ErrorCode::IoError,
+                            "Short write while writing database page");
     }
     file_.flush();
+    if (!file_) {
+        throw DatabaseError(ErrorCode::IoError,
+                            "Unable to flush database page");
+    }
+
+    std::error_code error;
+    const auto file_size = std::filesystem::file_size(path_, error);
+    const auto expected_size =
+        (static_cast<std::uintmax_t>(std::max<std::size_t>(
+             physical_page_count(), static_cast<std::size_t>(page_id) + 1))) *
+        static_cast<std::uintmax_t>(kPageSize);
+    if (error || file_size != expected_size) {
+        throw DatabaseError(ErrorCode::IoError,
+                            "Database file size does not match completed page write");
+    }
 }
 
 void DiskManager::read_page(PageId page_id, std::vector<std::uint8_t>& page) {

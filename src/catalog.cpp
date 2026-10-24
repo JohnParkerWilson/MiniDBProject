@@ -1,9 +1,11 @@
 #include "localdb/catalog.h"
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <system_error>
+#include <unordered_set>
 
 namespace localdb {
 namespace {
@@ -203,12 +205,25 @@ void Catalog::load() {
     }
     next_table_id_ = read_u32(bytes, offset);
     const auto table_count = read_u32(bytes, offset);
+    if (next_table_id_ == 0 || table_count > bytes.size()) {
+        throw DatabaseError(ErrorCode::Corruption, "Catalog contains invalid table metadata");
+    }
     tables_.clear();
     tables_.reserve(table_count);
+
+    std::unordered_set<TableId> table_ids;
+    std::unordered_set<std::string> table_names;
+    TableId largest_table_id = 0;
 
     for (std::uint32_t i = 0; i < table_count; ++i) {
         const TableId id = read_u32(bytes, offset);
         const std::string name = read_string(bytes, offset);
+        if (id == 0 || !table_ids.insert(id).second ||
+            name.empty() || !table_names.insert(name).second) {
+            throw DatabaseError(ErrorCode::Corruption,
+                                "Catalog contains duplicate or invalid table metadata");
+        }
+        largest_table_id = std::max(largest_table_id, id);
         const auto column_count = read_u32(bytes, offset);
         std::vector<Column> columns;
         columns.reserve(column_count);
@@ -231,6 +246,11 @@ void Catalog::load() {
         }
         tables_.push_back(TableInfo{
             id, name, Schema(std::move(columns)), std::move(physical_pages)});
+    }
+
+    if (next_table_id_ <= largest_table_id) {
+        throw DatabaseError(ErrorCode::Corruption,
+                            "Catalog next table ID is not greater than existing IDs");
     }
 
     if (offset != bytes.size()) {

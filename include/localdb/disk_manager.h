@@ -42,6 +42,7 @@ private:
     void open_or_create();
     static std::streamoff offset_for(DiskPageId page_id);
     void ensure_open() const;
+    void validate_catalog_mappings() const;
     DiskPageId allocate_physical_page();
     void read_physical_page(DiskPageId page_id, std::vector<std::uint8_t>& page);
     void write_physical_page(DiskPageId page_id, const std::vector<std::uint8_t>& page);
