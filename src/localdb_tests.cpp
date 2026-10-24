@@ -1,3 +1,4 @@
+#include "localdb/bitmap.h"
 #include "localdb/catalog.h"
 #include "localdb/disk_manager.h"
 #include "localdb/identifiers.h"
@@ -22,6 +23,33 @@ int main() {
         }
         assert(false && "Expected DatabaseError was not thrown");
     };
+
+    Bitmap bitmap(130);
+    assert(bitmap.size() == 130);
+    assert(!bitmap.get(0));
+    assert(!bitmap.set(0));
+    assert(bitmap.get(0));
+    assert(bitmap.set(0));
+    assert(bitmap.clear(0));
+    assert(!bitmap.clear(0));
+
+    assert(bitmap.set(129) == false);
+    assert(bitmap.find_first_zero(0).value() == 0);
+    assert(bitmap.find_first_zero(129).value() == 0);
+    assert(bitmap.set(0) == false);
+    assert(bitmap.find_first_zero(129).value() == 1);
+
+    for (std::size_t index = 0; index < bitmap.size(); ++index) {
+        bitmap.set(index);
+    }
+    assert(!bitmap.find_first_zero(0).has_value());
+    expect_error([&] { bitmap.get(130); }, ErrorCode::InvalidArgument);
+    expect_error([&] { bitmap.set(130); }, ErrorCode::InvalidArgument);
+    expect_error([&] { bitmap.clear(130); }, ErrorCode::InvalidArgument);
+    expect_error([&] { bitmap.find_first_zero(130); }, ErrorCode::InvalidArgument);
+
+    Bitmap empty_bitmap(0);
+    assert(!empty_bitmap.find_first_zero(0).has_value());
 
     const Schema schema({
         Column("id", TypeId::Int32),
