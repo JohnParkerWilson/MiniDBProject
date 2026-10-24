@@ -312,15 +312,35 @@ std::optional<std::vector<std::uint8_t>> HeapPage::get(const RID& rid) const {
     if (!occupied(rid.slot_id)) {
         return std::nullopt;
     }
-    const auto begin = buffer_.begin() + tuple_offset(rid.slot_id);
-    return std::vector<std::uint8_t>(begin, begin + tuple_size_);
+    std::vector<std::uint8_t> result(tuple_size_);
+    read(rid.slot_id, result);
+    return result;
+}
+
+void HeapPage::read(SlotId slot_id, std::vector<std::uint8_t>& output) const {
+    if (slot_id >= slot_count_) {
+        throw DatabaseError(ErrorCode::InvalidArgument,
+                            "Heap-page slot is out of range");
+    }
+    if (output.size() < tuple_size_) {
+        throw DatabaseError(ErrorCode::InvalidArgument,
+                            "Read output buffer is too small for the tuple");
+    }
+    if (!occupied(slot_id)) {
+        throw DatabaseError(ErrorCode::RecordNotFound,
+                            "Heap-page slot is free or logically deleted");
+    }
+
+    const auto begin = buffer_.begin() + tuple_offset(slot_id);
+    std::copy(begin, begin + tuple_size_, output.begin());
 }
 
 bool HeapPage::update(const RID& rid, const std::vector<std::uint8_t>& tuple) {
     validate_rid(rid);
     validate_tuple(tuple);
     if (!occupied(rid.slot_id)) {
-        return false;
+        throw DatabaseError(ErrorCode::RecordNotFound,
+                            "Heap-page slot is free or logically deleted");
     }
     std::copy(tuple.begin(), tuple.end(), buffer_.begin() + tuple_offset(rid.slot_id));
     return true;
@@ -329,7 +349,8 @@ bool HeapPage::update(const RID& rid, const std::vector<std::uint8_t>& tuple) {
 bool HeapPage::erase(const RID& rid) {
     validate_rid(rid);
     if (!occupied(rid.slot_id)) {
-        return false;
+        throw DatabaseError(ErrorCode::RecordNotFound,
+                            "Heap-page slot is free or logically deleted");
     }
     // Logical deletion preserves both the allocation bit and tuple bytes.
     set_deletion_bit(rid.slot_id, true);

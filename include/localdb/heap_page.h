@@ -57,6 +57,10 @@ public:
     // Returns nullopt when the slot is valid but currently empty.
     std::optional<std::vector<std::uint8_t>> get(const RID& rid) const;
 
+    // Copies exactly tuple_width() bytes into the beginning of output. The
+    // output vector must already have room for the complete tuple.
+    void read(SlotId slot_id, std::vector<std::uint8_t>& output) const;
+
     // Returns false when the slot is valid but empty.
     bool update(const RID& rid, const std::vector<std::uint8_t>& tuple);
     bool erase(const RID& rid);
