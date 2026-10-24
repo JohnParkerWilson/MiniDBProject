@@ -1,4 +1,3 @@
-
 cmake_minimum_required(VERSION 3.16)
 project(localdb LANGUAGES CXX)
 
@@ -10,6 +9,7 @@ add_library(localdb
     src/bitmap.cpp
     src/catalog.cpp
     src/disk_manager.cpp
+    src/heap_page.cpp
     src/schema.cpp
     src/tuple.cpp
 )

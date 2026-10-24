@@ -1,6 +1,7 @@
 #include "localdb/bitmap.h"
 #include "localdb/catalog.h"
 #include "localdb/disk_manager.h"
+#include "localdb/heap_page.h"
 #include "localdb/identifiers.h"
 #include "localdb/tuple.h"
 
@@ -98,6 +99,40 @@ int main() {
     assert(word_boundary_bitmap.find_first_zero(63).value() == 63);
     word_boundary_bitmap.set(63);
     assert(word_boundary_bitmap.find_first_zero(64).value() == 0);
+
+    const PageId heap_page_id{7, 3};
+    HeapPage heap_page(heap_page_id, 16);
+    assert(heap_page.slot_count() > 0);
+    assert(heap_page.free_slot_count() == heap_page.slot_count());
+
+    const std::vector<std::uint8_t> first_tuple(16, 0x11);
+    const auto first_rid = heap_page.insert(first_tuple);
+    assert(first_rid.has_value());
+    assert(first_rid->page_id == heap_page_id);
+    assert(heap_page.occupied(first_rid->slot_id));
+    assert(heap_page.get(*first_rid).value() == first_tuple);
+
+    const std::vector<std::uint8_t> second_tuple(16, 0x22);
+    assert(heap_page.update(*first_rid, second_tuple));
+    assert(heap_page.get(*first_rid).value() == second_tuple);
+    assert(heap_page.erase(*first_rid));
+    assert(!heap_page.get(*first_rid).has_value());
+    assert(!heap_page.erase(*first_rid));
+
+    const auto persisted_heap_buffer = heap_page.buffer();
+    const auto reopened_heap_page =
+        HeapPage::from_buffer(heap_page_id, 16, persisted_heap_buffer);
+    assert(reopened_heap_page.free_slot_count() == reopened_heap_page.slot_count());
+
+    expect_error(
+        [&] { heap_page.insert(std::vector<std::uint8_t>(15, 0)); },
+        ErrorCode::InvalidArgument);
+    expect_error(
+        [&] { heap_page.get(RID{PageId{7, 4}, 0}); },
+        ErrorCode::InvalidArgument);
+    expect_error(
+        [&] { HeapPage::from_buffer(PageId{7, 3}, 16, HeapPage::Buffer{}); },
+        ErrorCode::Corruption);
 
     const Schema schema({
         Column("id", TypeId::Int32),
