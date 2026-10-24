@@ -13,6 +13,7 @@ struct TableInfo {
     TableId id;
     std::string name;
     Schema schema;
+    std::vector<DiskPageId> physical_pages;
 };
 
 // Persistent table catalog. The catalog file stores stable table IDs, table
@@ -24,6 +25,9 @@ public:
     TableId create_table(std::string name, Schema schema);
     const TableInfo& table(TableId table_id) const;
     const TableInfo& table(const std::string& name) const;
+    PageId add_page(TableId table_id, DiskPageId physical_page_id);
+    DiskPageId physical_page(PageId page_id) const;
+    std::size_t page_count(TableId table_id) const;
     const std::vector<TableInfo>& tables() const noexcept { return tables_; }
     std::size_t table_count() const noexcept { return tables_.size(); }
 

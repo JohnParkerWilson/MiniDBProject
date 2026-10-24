@@ -5,14 +5,28 @@
 
 namespace localdb {
 
-DiskManager::DiskManager(const std::filesystem::path& path) : path_(path) {
+DiskManager::DiskManager(const std::filesystem::path& path,
+                         std::filesystem::path catalog_path)
+    : path_(path),
+      catalog_(catalog_path.empty() ? std::filesystem::path(path.string() + ".catalog")
+                                    : std::move(catalog_path)) {
     open_or_create();
 }
 
 DiskManager::~DiskManager() {
-    if (file_.is_open()) {
-        file_.flush();
-        file_.close();
+    try {
+        close();
+    } catch (...) {
+        // Destructors must not throw. Explicit close() or sync() reports errors.
+        if (file_.is_open()) {
+            file_.close();
+        }
+    }
+}
+
+void DiskManager::ensure_open() const {
+    if (closed_ || !file_.is_open()) {
+        throw DatabaseError(ErrorCode::IoError, "Database is closed");
     }
 }
 
@@ -32,11 +46,11 @@ void DiskManager::open_or_create() {
     }
 }
 
-std::streamoff DiskManager::offset_for(PageId page_id) {
+std::streamoff DiskManager::offset_for(DiskPageId page_id) {
     return static_cast<std::streamoff>(page_id) * static_cast<std::streamoff>(kPageSize);
 }
 
-std::size_t DiskManager::page_count() const {
+std::size_t DiskManager::physical_page_count() const {
     std::error_code error;
     const auto size = std::filesystem::file_size(path_, error);
     if (error || size % kPageSize != 0) {
@@ -45,19 +59,46 @@ std::size_t DiskManager::page_count() const {
     return static_cast<std::size_t>(size / kPageSize);
 }
 
-PageId DiskManager::allocate_page() {
-    const auto count = page_count();
-    if (count > std::numeric_limits<PageId>::max()) {
+DiskPageId DiskManager::allocate_physical_page() {
+    ensure_open();
+    const auto count = physical_page_count();
+    if (count > std::numeric_limits<DiskPageId>::max()) {
         throw DatabaseError(ErrorCode::IoError, "Database has too many pages");
     }
     std::vector<std::uint8_t> empty_page(kPageSize, 0);
-    write_page(static_cast<PageId>(count), empty_page);
-    return static_cast<PageId>(count);
+    write_physical_page(static_cast<DiskPageId>(count), empty_page);
+    return static_cast<DiskPageId>(count);
 }
 
-void DiskManager::read_page(PageId page_id, std::vector<std::uint8_t>& page) {
-    if (page_id >= page_count()) {
-        throw DatabaseError(ErrorCode::PageNotFound, "Requested page does not exist");
+TableId DiskManager::create_table(std::string name, Schema schema) {
+    ensure_open();
+    return catalog_.create_table(std::move(name), std::move(schema));
+}
+
+const TableInfo& DiskManager::open_table(TableId table_id) const {
+    ensure_open();
+    return catalog_.table(table_id);
+}
+
+const TableInfo& DiskManager::open_table(const std::string& name) const {
+    ensure_open();
+    return catalog_.table(name);
+}
+
+PageId DiskManager::allocate_page(TableId table_id) {
+    ensure_open();
+    catalog_.table(table_id);
+    const DiskPageId physical_page_id = allocate_physical_page();
+    // The zero-filled physical page is initialized before its logical ID is exposed.
+    return catalog_.add_page(table_id, physical_page_id);
+}
+
+void DiskManager::read_physical_page(DiskPageId page_id,
+                                     std::vector<std::uint8_t>& page) {
+    ensure_open();
+    if (page_id >= physical_page_count()) {
+        throw DatabaseError(ErrorCode::PageNotFound,
+                            "Requested physical page does not exist");
     }
     page.assign(kPageSize, 0);
     file_.clear();
@@ -68,11 +109,13 @@ void DiskManager::read_page(PageId page_id, std::vector<std::uint8_t>& page) {
     }
 }
 
-void DiskManager::write_page(PageId page_id, const std::vector<std::uint8_t>& page) {
+void DiskManager::write_physical_page(
+    DiskPageId page_id, const std::vector<std::uint8_t>& page) {
+    ensure_open();
     if (page.size() != kPageSize) {
         throw DatabaseError(ErrorCode::InvalidArgument, "A database page must be exactly 4096 bytes");
     }
-    if (page_id > page_count()) {
+    if (page_id > physical_page_count()) {
         throw DatabaseError(ErrorCode::PageNotFound, "Cannot write a page beyond the next page id");
     }
     file_.clear();
@@ -84,11 +127,43 @@ void DiskManager::write_page(PageId page_id, const std::vector<std::uint8_t>& pa
     file_.flush();
 }
 
-void DiskManager::flush() {
+void DiskManager::read_page(PageId page_id, std::vector<std::uint8_t>& page) {
+    ensure_open();
+    read_physical_page(catalog_.physical_page(page_id), page);
+}
+
+void DiskManager::write_page(PageId page_id, const std::vector<std::uint8_t>& page) {
+    ensure_open();
+    write_physical_page(catalog_.physical_page(page_id), page);
+}
+
+std::size_t DiskManager::page_count(TableId table_id) const {
+    ensure_open();
+    return catalog_.page_count(table_id);
+}
+
+void DiskManager::sync() {
+    ensure_open();
     file_.flush();
     if (!file_) {
         throw DatabaseError(ErrorCode::IoError, "Unable to flush database file");
     }
+    catalog_.flush();
+}
+
+void DiskManager::flush() {
+    sync();
+}
+
+void DiskManager::close() {
+    if (closed_) {
+        return;
+    }
+    if (file_.is_open()) {
+        sync();
+        file_.close();
+    }
+    closed_ = true;
 }
 
 }  // namespace localdb

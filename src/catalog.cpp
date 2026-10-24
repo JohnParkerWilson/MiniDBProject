@@ -9,7 +9,7 @@ namespace localdb {
 namespace {
 
 constexpr char kMagic[] = "LDBCAT01";
-constexpr std::uint32_t kFormatVersion = 1;
+constexpr std::uint32_t kFormatVersion = 2;
 
 void append_u8(std::vector<std::uint8_t>& output, std::uint8_t value) {
     output.push_back(value);
@@ -83,7 +83,7 @@ TableId Catalog::create_table(std::string name, Schema schema) {
     }
 
     const TableId id = next_table_id_++;
-    tables_.push_back(TableInfo{id, std::move(name), std::move(schema)});
+    tables_.push_back(TableInfo{id, std::move(name), std::move(schema), {}});
     flush();
     return id;
 }
@@ -106,6 +106,35 @@ const TableInfo& Catalog::table(const std::string& name) const {
     throw DatabaseError(ErrorCode::InvalidArgument, "Table name does not exist");
 }
 
+PageId Catalog::add_page(TableId table_id, DiskPageId physical_page_id) {
+    for (auto& table_info : tables_) {
+        if (table_info.id == table_id) {
+            if (table_info.physical_pages.size() > std::numeric_limits<PageNumber>::max()) {
+                throw DatabaseError(ErrorCode::IoError, "Table has too many pages");
+            }
+            table_info.physical_pages.push_back(physical_page_id);
+            const PageId page_id{
+                table_id,
+                static_cast<PageNumber>(table_info.physical_pages.size() - 1)};
+            flush();
+            return page_id;
+        }
+    }
+    throw DatabaseError(ErrorCode::InvalidArgument, "Table ID does not exist");
+}
+
+DiskPageId Catalog::physical_page(PageId page_id) const {
+    const auto& table_info = table(page_id.table_id);
+    if (page_id.page_number >= table_info.physical_pages.size()) {
+        throw DatabaseError(ErrorCode::PageNotFound, "Logical page does not exist");
+    }
+    return table_info.physical_pages[page_id.page_number];
+}
+
+std::size_t Catalog::page_count(TableId table_id) const {
+    return table(table_id).physical_pages.size();
+}
+
 void Catalog::flush() const {
     std::vector<std::uint8_t> bytes;
     bytes.insert(bytes.end(), kMagic, kMagic + sizeof(kMagic) - 1);
@@ -121,6 +150,10 @@ void Catalog::flush() const {
             append_string(bytes, column.name);
             append_u8(bytes, static_cast<std::uint8_t>(column.type));
             append_u8(bytes, column.nullable ? 1 : 0);
+        }
+        append_u32(bytes, static_cast<std::uint32_t>(table_info.physical_pages.size()));
+        for (const auto physical_page_id : table_info.physical_pages) {
+            append_u32(bytes, physical_page_id);
         }
     }
 
@@ -164,7 +197,8 @@ void Catalog::load() {
     }
 
     std::size_t offset = magic_size;
-    if (read_u32(bytes, offset) != kFormatVersion) {
+    const auto format_version = read_u32(bytes, offset);
+    if (format_version != 1 && format_version != kFormatVersion) {
         throw DatabaseError(ErrorCode::Corruption, "Unsupported catalog format version");
     }
     next_table_id_ = read_u32(bytes, offset);
@@ -187,7 +221,16 @@ void Catalog::load() {
             }
             columns.emplace_back(column_name, static_cast<TypeId>(raw_type), raw_nullable != 0);
         }
-        tables_.push_back(TableInfo{id, name, Schema(std::move(columns))});
+        std::vector<DiskPageId> physical_pages;
+        if (format_version >= 2) {
+            const auto page_count = read_u32(bytes, offset);
+            physical_pages.reserve(page_count);
+            for (std::uint32_t page_index = 0; page_index < page_count; ++page_index) {
+                physical_pages.push_back(read_u32(bytes, offset));
+            }
+        }
+        tables_.push_back(TableInfo{
+            id, name, Schema(std::move(columns)), std::move(physical_pages)});
     }
 
     if (offset != bytes.size()) {

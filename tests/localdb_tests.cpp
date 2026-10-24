@@ -1,9 +1,12 @@
+#include "localdb/catalog.h"
 #include "localdb/disk_manager.h"
+#include "localdb/identifiers.h"
 #include "localdb/tuple.h"
 
 #include <cassert>
 #include <filesystem>
 #include <iostream>
+#include <unordered_map>
 
 int main() {
     using namespace localdb;
@@ -14,10 +17,10 @@ int main() {
         Column("active", TypeId::Boolean),
         Column("code", TypeId::String32),
         Column("name", TypeId::Varchar),
-    });
+        });
     const Tuple original({
         std::int32_t{7}, std::int64_t{9000}, true,
-        std::string("DB-001"), std::string("Ada")});
+        std::string("DB-001"), std::string("Ada") });
     const auto encoded = original.serialize(schema);
     const auto decoded = Tuple::deserialize(schema, encoded);
     assert(std::get<std::int32_t>(decoded.value_at(0)) == 7);
@@ -28,8 +31,8 @@ int main() {
 
     // The first field starts after the 2-byte field count and 1-byte null flag.
     // 0x01020304 must be stored least-significant byte first.
-    const Schema endian_schema({Column("number", TypeId::Int32)});
-    const Tuple endian_tuple({std::int32_t{0x01020304}});
+    const Schema endian_schema({ Column("number", TypeId::Int32) });
+    const Tuple endian_tuple({ std::int32_t{0x01020304} });
     const auto endian_bytes = endian_tuple.serialize(endian_schema);
     assert(endian_bytes[3] == 0x04);
     assert(endian_bytes[4] == 0x03);
@@ -43,7 +46,7 @@ int main() {
         Column("exact_fixed", TypeId::String32),
         Column("empty_varchar", TypeId::Varchar),
         Column("utf8", TypeId::String32),
-    });
+        });
     const std::string exactly_32_bytes = "12345678901234567890123456789012";
     const std::string utf8_text = "café 世界";
     assert(exactly_32_bytes.size() == 32);
@@ -56,7 +59,7 @@ int main() {
         exactly_32_bytes,
         std::string(),
         utf8_text,
-    });
+        });
     const auto edge_encoded = edge_original.serialize(edge_schema);
     const auto edge_decoded = Tuple::deserialize(edge_schema, edge_encoded);
     assert(std::get<std::int32_t>(edge_decoded.value_at(0)) == -123456);
@@ -66,19 +69,94 @@ int main() {
     assert(std::get<std::string>(edge_decoded.value_at(4)).empty());
     assert(std::get<std::string>(edge_decoded.value_at(5)) == utf8_text);
 
+    const PageId table_one_page_zero{ 1, 0 };
+    const PageId table_two_page_zero{ 2, 0 };
+    assert(table_one_page_zero != table_two_page_zero);
+
+    std::unordered_map<PageId, int, PageIdHash> buffer_pool_pages;
+    buffer_pool_pages[table_one_page_zero] = 10;
+    buffer_pool_pages[table_two_page_zero] = 20;
+    assert(buffer_pool_pages.size() == 2);
+    assert(buffer_pool_pages.at(table_one_page_zero) == 10);
+    assert(buffer_pool_pages.at(table_two_page_zero) == 20);
+
+    const RID first_record{ table_one_page_zero, 0 };
+    const RID second_record{ table_one_page_zero, 1 };
+    assert(first_record != second_record);
+
+    const auto catalog_path = std::filesystem::temp_directory_path() / "localdb_catalog.db";
+    std::filesystem::remove(catalog_path);
+    {
+        Catalog catalog(catalog_path);
+        const TableId users_id = catalog.create_table(
+            "users",
+            Schema({
+                Column("id", TypeId::Int32),
+                Column("username", TypeId::String32),
+                }));
+        const TableId logs_id = catalog.create_table(
+            "logs",
+            Schema({ Column("message", TypeId::Varchar, true) }));
+        assert(users_id != logs_id);
+        assert(catalog.table_count() == 2);
+    }
+    {
+        Catalog reopened_catalog(catalog_path);
+        const auto& users = reopened_catalog.table("users");
+        const auto& logs = reopened_catalog.table("logs");
+        assert(users.id == 1);
+        assert(logs.id == 2);
+        assert(users.schema.column_count() == 2);
+        assert(users.schema.column(0).type == TypeId::Int32);
+        assert(users.schema.column(1).type == TypeId::String32);
+        assert(logs.schema.column(0).nullable);
+
+        const TableId next_id = reopened_catalog.create_table(
+            "sessions", Schema({ Column("token", TypeId::String32) }));
+        assert(next_id == 3);
+    }
+    std::filesystem::remove(catalog_path);
+
     const auto path = std::filesystem::temp_directory_path() / "localdb_initial_test.db";
     std::filesystem::remove(path);
+    std::filesystem::remove(path.string() + ".catalog");
     {
         DiskManager disk(path);
-        const auto page_id = disk.allocate_page();
+        const TableId table_id = disk.create_table(
+            "pages", Schema({ Column("value", TypeId::Int32) }));
+        const TableId other_table_id = disk.create_table(
+            "other_pages", Schema({ Column("value", TypeId::Int32) }));
+        const auto page_id = disk.allocate_page(table_id);
+        const auto second_page_id = disk.allocate_page(table_id);
+        const auto other_page_id = disk.allocate_page(other_table_id);
+        assert(page_id.page_number == 0);
+        assert(second_page_id.page_number == 1);
+        assert(other_page_id.page_number == 0);
+        assert(other_page_id != page_id);
         std::vector<std::uint8_t> page(kPageSize, 0);
+        std::vector<std::uint8_t> initialized_page;
+        disk.read_page(page_id, initialized_page);
+        for (const auto byte : initialized_page) {
+            assert(byte == 0);
+        }
         page[0] = 42;
         disk.write_page(page_id, page);
         std::vector<std::uint8_t> read_back;
         disk.read_page(page_id, read_back);
         assert(read_back == page);
+        disk.close();
+    }
+    {
+        DiskManager reopened(path);
+        const auto& table = reopened.open_table("pages");
+        assert(table.id == 1);
+        assert(reopened.page_count(table.id) == 2);
+        const auto third_page_id = reopened.allocate_page(table.id);
+        assert(third_page_id.page_number == 2);
+        reopened.sync();
     }
     std::filesystem::remove(path);
+    std::filesystem::remove(path.string() + ".catalog");
 
     std::cout << "All initial localdb tests passed.\n";
     return 0;
