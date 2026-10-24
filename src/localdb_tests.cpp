@@ -13,8 +13,231 @@
 #include <unordered_map>
 #include <vector>
 
+void test_required_heap_page_sequence() {
+    using namespace localdb;
+
+    const auto expect_error = [](auto operation, ErrorCode expected_code) {
+        try {
+            operation();
+        } catch (const DatabaseError& error) {
+            assert(error.code() == expected_code);
+            return;
+        }
+        assert(false && "Expected DatabaseError was not thrown");
+    };
+
+    const PageId page_id{99, 0};
+    HeapPage::Buffer buffer(kPageSize, 0xa5);
+
+    // 1. Initialize an empty page.
+    HeapPage::Initialize(buffer, 16);
+    HeapPage page = HeapPage::Open(page_id, buffer, 16);
+    assert(page.allocated_slot_count() == 0);
+    assert(page.free_slot_count() == page.slot_capacity());
+    expect_error(
+        [&] {
+            std::vector<std::uint8_t> output(16);
+            page.read(0, output);
+        },
+        ErrorCode::RecordNotFound);
+
+    // 2. Fill every allocation slot and verify each RID and tuple.
+    std::vector<RID> rids;
+    std::vector<std::vector<std::uint8_t>> tuples;
+    rids.reserve(page.slot_capacity());
+    tuples.reserve(page.slot_capacity());
+    for (std::size_t slot = 0; slot < page.slot_capacity(); ++slot) {
+        const std::vector<std::uint8_t> tuple(
+            page.tuple_width(), static_cast<std::uint8_t>(slot + 1));
+        const auto rid = page.insert(tuple);
+        assert(rid.has_value());
+        assert(rid->page_id == page_id);
+        assert(rid->slot_id == slot);
+
+        std::vector<std::uint8_t> output(page.tuple_width(), 0);
+        page.read(rid->slot_id, output);
+        assert(output == tuple);
+        rids.push_back(*rid);
+        tuples.push_back(tuple);
+    }
+
+    assert(page.allocated_slot_count() == page.slot_capacity());
+    const auto full_page_before_insert = page.buffer();
+    assert(!page.insert(std::vector<std::uint8_t>(page.tuple_width(), 0xff)));
+    assert(page.buffer() == full_page_before_insert);
+
+    // 3. Update one live tuple without changing its RID or allocation count.
+    const auto updated_tuple = std::vector<std::uint8_t>(page.tuple_width(), 0xf0);
+    const auto count_before_update = page.allocated_slot_count();
+    assert(page.update(rids[0], updated_tuple));
+    assert(page.allocated_slot_count() == count_before_update);
+    assert(page.is_allocated(rids[0].slot_id));
+    assert(!page.is_deleted(rids[0].slot_id));
+    std::vector<std::uint8_t> updated_output(page.tuple_width());
+    page.read(rids[0].slot_id, updated_output);
+    assert(updated_output == updated_tuple);
+
+    // 4. Delete another tuple. It remains allocated and cannot be reused.
+    const auto count_before_delete = page.allocated_slot_count();
+    assert(page.erase(rids[1]));
+    assert(page.allocated_slot_count() == count_before_delete);
+    assert(page.is_allocated(rids[1].slot_id));
+    assert(page.is_deleted(rids[1].slot_id));
+    expect_error(
+        [&] {
+            std::vector<std::uint8_t> output(page.tuple_width());
+            page.read(rids[1].slot_id, output);
+        },
+        ErrorCode::RecordNotFound);
+    const auto full_deleted_page = page.buffer();
+    assert(!page.insert(std::vector<std::uint8_t>(page.tuple_width(), 0xee)));
+    assert(page.buffer() == full_deleted_page);
+
+    // 5. Reopen a copied 4096-byte buffer and verify every state.
+    const auto copied_buffer = page.buffer();
+    HeapPage reopened = HeapPage::Open(page_id, copied_buffer, 16);
+    assert(reopened.tuple_width() == page.tuple_width());
+    assert(reopened.slot_capacity() == page.slot_capacity());
+    assert(reopened.allocated_slot_count() == page.allocated_slot_count());
+    for (std::size_t slot = 0; slot < reopened.slot_capacity(); ++slot) {
+        if (slot == rids[1].slot_id) {
+            assert(reopened.is_allocated(static_cast<SlotId>(slot)));
+            assert(reopened.is_deleted(static_cast<SlotId>(slot)));
+            expect_error(
+                [&] {
+                    std::vector<std::uint8_t> output(reopened.tuple_width());
+                    reopened.read(static_cast<SlotId>(slot), output);
+                },
+                ErrorCode::RecordNotFound);
+        } else {
+            std::vector<std::uint8_t> output(reopened.tuple_width());
+            reopened.read(static_cast<SlotId>(slot), output);
+            assert(output == (slot == 0 ? updated_tuple : tuples[slot]));
+        }
+    }
+}
+
+void test_heap_page_failure_cases() {
+    using namespace localdb;
+
+    const auto expect_error = [](auto operation, ErrorCode expected_code) {
+        try {
+            operation();
+        } catch (const DatabaseError& error) {
+            assert(error.code() == expected_code);
+            return;
+        }
+        assert(false && "Expected DatabaseError was not thrown");
+    };
+
+    // Multiple valid tuple widths must produce reopenable pages.
+    for (const std::size_t width : {std::size_t{8}, std::size_t{16}, std::size_t{40}}) {
+        HeapPage::Buffer buffer(kPageSize, 0xa5);
+        HeapPage::Initialize(buffer, width);
+        const HeapPage page = HeapPage::Open(
+            PageId{100, static_cast<PageNumber>(width)}, buffer, width);
+        assert(page.tuple_width() == width);
+        assert(page.slot_capacity() > 0);
+    }
+
+    // A width that cannot leave room for one complete tuple is invalid.
+    expect_error(
+        [&] {
+            HeapPage::Buffer oversized_width_buffer(kPageSize);
+            HeapPage::Initialize(oversized_width_buffer, 4088);
+        },
+        ErrorCode::InvalidArgument);
+
+    HeapPage page(PageId{101, 0}, 16);
+    const std::vector<std::uint8_t> tuple(page.tuple_width(), 0x42);
+    const auto rid = page.insert(tuple);
+    assert(rid.has_value());
+
+    // Invalid slot indices and tuple lengths must not change the page.
+    const auto before_invalid_operations = page.buffer();
+    const SlotId invalid_slot = static_cast<SlotId>(page.slot_capacity());
+    expect_error([&] { page.is_allocated(invalid_slot); }, ErrorCode::InvalidArgument);
+    expect_error([&] { page.is_deleted(invalid_slot); }, ErrorCode::InvalidArgument);
+    expect_error(
+        [&] {
+            std::vector<std::uint8_t> invalid_output(16);
+            page.read(invalid_slot, invalid_output);
+        },
+        ErrorCode::InvalidArgument);
+    expect_error([&] { page.erase(RID{page.page_id(), invalid_slot}); },
+                 ErrorCode::InvalidArgument);
+    expect_error([&] { page.update(*rid, std::vector<std::uint8_t>(15)); },
+                 ErrorCode::InvalidArgument);
+    expect_error([&] { page.insert(std::vector<std::uint8_t>(17)); },
+                 ErrorCode::InvalidArgument);
+    assert(page.buffer() == before_invalid_operations);
+
+    // A short read-output buffer must leave both page and output unchanged.
+    std::vector<std::uint8_t> short_output(15, 0x7a);
+    const auto short_output_before = short_output;
+    expect_error([&] { page.read(rid->slot_id, short_output); },
+                 ErrorCode::InvalidArgument);
+    assert(short_output == short_output_before);
+    assert(page.buffer() == before_invalid_operations);
+
+    // Repeated deletion must fail without changing state.
+    assert(page.erase(*rid));
+    const auto after_first_delete = page.buffer();
+    expect_error([&] { page.erase(*rid); }, ErrorCode::RecordNotFound);
+    assert(page.buffer() == after_first_delete);
+
+    const auto write_u16 = [](HeapPage::Buffer& buffer, std::size_t offset,
+                              std::uint16_t value) {
+        buffer[offset] = static_cast<std::uint8_t>(value & 0xff);
+        buffer[offset + 1] = static_cast<std::uint8_t>((value >> 8) & 0xff);
+    };
+
+    HeapPage::Buffer valid_buffer(kPageSize, 0);
+    HeapPage::Initialize(valid_buffer, 16);
+
+    // Malformed header: bad magic, version, tuple width, capacity, and reserved bytes.
+    for (const auto mutate_header : {
+             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20}) {
+        auto malformed = valid_buffer;
+        if (mutate_header < 4) {
+            malformed[8 + mutate_header] ^= 0xff;
+        } else if (mutate_header == 4) {
+            write_u16(malformed, 12, 2);
+        } else if (mutate_header == 5) {
+            write_u16(malformed, 14, 24);
+        } else if (mutate_header == 6) {
+            write_u16(malformed, 16, 1);
+        } else {
+            malformed[20] = 1;
+        }
+        expect_error(
+            [&] { HeapPage::Open(PageId{102, 0}, malformed, 16); },
+            ErrorCode::Corruption);
+    }
+
+    // Invalid bitmap state: deletion set while allocation is clear.
+    auto invalid_bitmap = valid_buffer;
+    const std::size_t bitmap_bytes =
+        ((static_cast<std::size_t>(invalid_bitmap[16]) |
+          (static_cast<std::size_t>(invalid_bitmap[17]) << 8)) + 63) / 64 * 8;
+    invalid_bitmap[24 + bitmap_bytes] |= 0x01;
+    expect_error(
+        [&] { HeapPage::Open(PageId{102, 0}, invalid_bitmap, 16); },
+        ErrorCode::Corruption);
+
+    // Allocated count inconsistent with the allocation bitmap.
+    auto invalid_count = valid_buffer;
+    write_u16(invalid_count, 18, 1);
+    expect_error(
+        [&] { HeapPage::Open(PageId{102, 0}, invalid_count, 16); },
+        ErrorCode::Corruption);
+}
+
 int main() {
     using namespace localdb;
+
+    test_required_heap_page_sequence();
+    test_heap_page_failure_cases();
 
     const auto expect_error = [](auto operation, ErrorCode expected_code) {
         try {
@@ -112,8 +335,10 @@ int main() {
     assert(heap_page.find_free_slot().value() == 0);
     assert(heap_page.buffer() == empty_page_before_search);
     std::vector<std::uint8_t> free_output(16, 0xbb);
+    const auto free_output_before = free_output;
     expect_error([&] { heap_page.read(0, free_output); },
                  ErrorCode::RecordNotFound);
+    assert(free_output == free_output_before);
     expect_error(
         [&] { heap_page.update(RID{heap_page_id, 0}, std::vector<std::uint8_t>(16, 0x44)); },
         ErrorCode::RecordNotFound);
@@ -140,6 +365,9 @@ int main() {
     assert(heap_page.is_allocated(first_rid->slot_id));
     assert(!heap_page.is_deleted(first_rid->slot_id));
     assert(heap_page.occupied(first_rid->slot_id));
+    assert(heap_page.get(*first_rid).value() == first_tuple);
+    auto independent_tuple = heap_page.get(*first_rid).value();
+    independent_tuple[0] = 0xff;
     assert(heap_page.get(*first_rid).value() == first_tuple);
     const auto page_before_read = heap_page.buffer();
     std::vector<std::uint8_t> read_output(20, 0xcc);
@@ -198,12 +426,15 @@ int main() {
     assert(heap_page.is_deleted(first_rid->slot_id));
     assert(!heap_page.occupied(first_rid->slot_id));
     assert(heap_page.find_free_slot().value() != first_rid->slot_id);
-    assert(heap_page.get(*first_rid) == std::nullopt);
+    expect_error([&] { heap_page.get(*first_rid); },
+                 ErrorCode::RecordNotFound);
     const auto page_before_deleted_read = heap_page.buffer();
     std::vector<std::uint8_t> deleted_output(16, 0xee);
+    const auto deleted_output_before = deleted_output;
     expect_error([&] { heap_page.read(first_rid->slot_id, deleted_output); },
                  ErrorCode::RecordNotFound);
     assert(heap_page.buffer() == page_before_deleted_read);
+    assert(deleted_output == deleted_output_before);
     expect_error(
         [&] { heap_page.update(*first_rid, second_tuple); },
         ErrorCode::RecordNotFound);
@@ -236,6 +467,10 @@ int main() {
         HeapPage::from_buffer(heap_page_id, 16, persisted_heap_buffer);
     assert(reopened_heap_page.free_slot_count() == 0);
     assert(reopened_heap_page.allocated_slot_count() == reopened_heap_page.slot_count());
+    assert(reopened_heap_page.is_allocated(first_rid->slot_id));
+    assert(reopened_heap_page.is_deleted(first_rid->slot_id));
+    assert(reopened_heap_page.is_allocated(reused_rid->slot_id));
+    assert(reopened_heap_page.is_deleted(reused_rid->slot_id));
     assert(reopened_heap_page.buffer() == persisted_heap_buffer);
 
     HeapPage::Buffer invalid_initialize_buffer(kPageSize, 0xa5);

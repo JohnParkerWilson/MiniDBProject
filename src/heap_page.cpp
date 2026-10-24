@@ -310,7 +310,8 @@ std::optional<SlotId> HeapPage::find_free_slot() const {
 std::optional<std::vector<std::uint8_t>> HeapPage::get(const RID& rid) const {
     validate_rid(rid);
     if (!occupied(rid.slot_id)) {
-        return std::nullopt;
+        throw DatabaseError(ErrorCode::RecordNotFound,
+                            "Heap-page slot is free or logically deleted");
     }
     std::vector<std::uint8_t> result(tuple_size_);
     read(rid.slot_id, result);

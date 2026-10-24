@@ -31,7 +31,8 @@ public:
     // tuple_size must be positive and small enough for at least one slot.
     HeapPage(PageId page_id, std::size_t tuple_size);
 
-    // Reconstructs a page from a buffer previously produced by buffer().
+    // Reconstructs an owned page from a buffer previously produced by
+    // buffer(). The input buffer is copied; it is not borrowed.
     static HeapPage from_buffer(PageId page_id, std::size_t tuple_size,
                                 const Buffer& buffer) {
         return Open(page_id, buffer, tuple_size);
@@ -47,6 +48,8 @@ public:
     std::size_t slot_count() const noexcept { return slot_count_; }
     std::size_t free_slot_count() const noexcept;
 
+    // The returned reference remains valid while this HeapPage object remains
+    // alive. Disk I/O is the caller's responsibility.
     const Buffer& buffer() const noexcept { return buffer_; }
 
     // Returns a new RID, or nullopt if the page is full. The tuple must have
@@ -54,7 +57,8 @@ public:
     std::optional<RID> insert(const std::vector<std::uint8_t>& tuple);
     std::optional<SlotId> find_free_slot() const;
 
-    // Returns nullopt when the slot is valid but currently empty.
+    // Returns an independently owned tuple copy. A missing/deleted slot throws
+    // RecordNotFound.
     std::optional<std::vector<std::uint8_t>> get(const RID& rid) const;
 
     // Copies exactly tuple_width() bytes into the beginning of output. The
