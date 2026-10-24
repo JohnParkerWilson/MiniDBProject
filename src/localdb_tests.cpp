@@ -104,11 +104,25 @@ int main() {
     HeapPage heap_page(heap_page_id, 16);
     assert(heap_page.slot_count() > 0);
     assert(heap_page.free_slot_count() == heap_page.slot_count());
+    assert(heap_page.buffer()[0] == 'H');
+    assert(heap_page.buffer()[1] == 'P');
+    assert(heap_page.buffer()[2] == 'G');
+    assert(heap_page.buffer()[3] == '1');
+    assert(heap_page.buffer()[4] == 0x01);
+    assert(heap_page.buffer()[5] == 0x00);
+    assert(heap_page.buffer()[6] == 0x10);
+    assert(heap_page.buffer()[7] == 0x00);
+    assert(heap_page.buffer()[8] == static_cast<std::uint8_t>(heap_page.slot_count() & 0xff));
+    assert(heap_page.buffer()[9] == static_cast<std::uint8_t>(heap_page.slot_count() >> 8));
+    assert(heap_page.buffer()[10] == 0x00);
+    assert(heap_page.buffer()[11] == 0x00);
 
     const std::vector<std::uint8_t> first_tuple(16, 0x11);
     const auto first_rid = heap_page.insert(first_tuple);
     assert(first_rid.has_value());
     assert(first_rid->page_id == heap_page_id);
+    assert(heap_page.allocated(first_rid->slot_id));
+    assert(!heap_page.deleted(first_rid->slot_id));
     assert(heap_page.occupied(first_rid->slot_id));
     assert(heap_page.get(*first_rid).value() == first_tuple);
 
@@ -116,13 +130,37 @@ int main() {
     assert(heap_page.update(*first_rid, second_tuple));
     assert(heap_page.get(*first_rid).value() == second_tuple);
     assert(heap_page.erase(*first_rid));
+    assert(heap_page.allocated(first_rid->slot_id));
+    assert(heap_page.deleted(first_rid->slot_id));
+    assert(!heap_page.occupied(first_rid->slot_id));
     assert(!heap_page.get(*first_rid).has_value());
     assert(!heap_page.erase(*first_rid));
+
+    const auto reused_rid = heap_page.insert(first_tuple);
+    assert(reused_rid.has_value());
+    assert(reused_rid->slot_id == first_rid->slot_id);
+    assert(!heap_page.deleted(reused_rid->slot_id));
+    assert(heap_page.occupied(reused_rid->slot_id));
+    assert(heap_page.erase(*reused_rid));
 
     const auto persisted_heap_buffer = heap_page.buffer();
     const auto reopened_heap_page =
         HeapPage::from_buffer(heap_page_id, 16, persisted_heap_buffer);
     assert(reopened_heap_page.free_slot_count() == reopened_heap_page.slot_count());
+    assert(reopened_heap_page.allocated_slot_count() == 1);
+    assert(reopened_heap_page.buffer() == persisted_heap_buffer);
+
+    HeapPage::Buffer invalid_initialize_buffer(kPageSize, 0xa5);
+    const auto invalid_before = invalid_initialize_buffer;
+    expect_error([&] { HeapPage::Initialize(invalid_initialize_buffer, 10); },
+                 ErrorCode::InvalidArgument);
+    assert(invalid_initialize_buffer == invalid_before);
+
+    HeapPage::Buffer wrong_size_buffer(12, 0xa5);
+    const auto wrong_size_before = wrong_size_buffer;
+    expect_error([&] { HeapPage::Initialize(wrong_size_buffer, 16); },
+                 ErrorCode::InvalidArgument);
+    assert(wrong_size_buffer == wrong_size_before);
 
     expect_error(
         [&] { heap_page.insert(std::vector<std::uint8_t>(15, 0)); },
@@ -132,7 +170,26 @@ int main() {
         ErrorCode::InvalidArgument);
     expect_error(
         [&] { HeapPage::from_buffer(PageId{7, 3}, 16, HeapPage::Buffer{}); },
-        ErrorCode::Corruption);
+        ErrorCode::InvalidArgument);
+    expect_error([&] { HeapPage(PageId{7, 4}, 0); }, ErrorCode::InvalidArgument);
+    expect_error([&] { HeapPage(PageId{7, 4}, 7); }, ErrorCode::InvalidArgument);
+    expect_error([&] { HeapPage(PageId{7, 4}, 10); }, ErrorCode::InvalidArgument);
+    expect_error([&] { HeapPage(PageId{7, 4}, 4088); }, ErrorCode::InvalidArgument);
+
+    const std::size_t test_tuple_width = 16;
+    std::size_t expected_capacity = (kPageSize - 16) / test_tuple_width;
+    const auto bitmap_bytes_for = [](std::size_t slots) {
+        return ((slots + 63) / 64) * sizeof(std::uint64_t);
+    };
+    while (16 + 2 * bitmap_bytes_for(expected_capacity) +
+               expected_capacity * test_tuple_width > kPageSize) {
+        --expected_capacity;
+    }
+    assert(heap_page.slot_count() == expected_capacity);
+    assert(16 + 2 * bitmap_bytes_for(heap_page.slot_count()) +
+               heap_page.slot_count() * heap_page.tuple_size() <= kPageSize);
+    assert(16 + 2 * bitmap_bytes_for(heap_page.slot_count() + 1) +
+               (heap_page.slot_count() + 1) * heap_page.tuple_size() > kPageSize);
 
     const Schema schema({
         Column("id", TypeId::Int32),

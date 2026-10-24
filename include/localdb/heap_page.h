@@ -3,7 +3,6 @@
 #include "localdb/disk_manager.h"
 #include "localdb/identifiers.h"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -13,20 +12,35 @@ namespace localdb {
 
 class HeapPage {
 public:
-    using Buffer = std::array<std::uint8_t, kPageSize>;
+    using Buffer = std::vector<std::uint8_t>;
 
-    // Creates a new empty page for fixed-size serialized tuples.
+    static constexpr std::uint16_t kFormatVersion = 1;
+
+    // Initialize validates all arguments before modifying buffer.
+    static void Initialize(Buffer& buffer, std::size_t tuple_width);
+
+    // Open never modifies buffer. It validates the complete persistent page
+    // representation before constructing the in-memory view.
+    static HeapPage Open(PageId page_id, const Buffer& buffer,
+                         std::size_t expected_tuple_width);
+
+    // Creates a new empty page for fixed-size serialized tuples. The layout is
+    // header, allocation bitmap, deletion bitmap, tuple slots, then padding.
+    // Tuple widths must be positive multiples of eight and must leave room for
+    // at least one complete tuple and both bitmap regions.
     // tuple_size must be positive and small enough for at least one slot.
     HeapPage(PageId page_id, std::size_t tuple_size);
 
     // Reconstructs a page from a buffer previously produced by buffer().
-    static HeapPage from_buffer(PageId page_id,
-                                std::size_t tuple_size,
-                                const Buffer& buffer);
+    static HeapPage from_buffer(PageId page_id, std::size_t tuple_size,
+                                const Buffer& buffer) {
+        return Open(page_id, buffer, tuple_size);
+    }
 
     PageId page_id() const noexcept { return page_id_; }
     std::size_t tuple_size() const noexcept { return tuple_size_; }
     std::size_t slot_count() const noexcept { return slot_count_; }
+    std::size_t allocated_slot_count() const noexcept { return allocated_count_; }
     std::size_t free_slot_count() const noexcept;
 
     const Buffer& buffer() const noexcept { return buffer_; }
@@ -43,28 +57,31 @@ public:
     bool erase(const RID& rid);
 
     bool occupied(SlotId slot_id) const;
+    bool allocated(SlotId slot_id) const;
+    bool deleted(SlotId slot_id) const;
 
 private:
-    static constexpr std::size_t kHeaderSize = 8;
+    static constexpr std::size_t kHeaderSize = 16;
 
     HeapPage(PageId page_id, std::size_t tuple_size, Buffer buffer,
-             std::size_t slot_count);
+             std::size_t slot_count, std::size_t allocated_count);
 
-    static std::size_t calculate_slot_count(std::size_t tuple_size);
     static std::size_t bitmap_bytes(std::size_t slot_count);
     static void write_u16(Buffer& buffer, std::size_t offset, std::uint16_t value);
     static std::uint16_t read_u16(const Buffer& buffer, std::size_t offset);
+    static std::size_t calculate_slot_count(std::size_t tuple_width);
 
-    void initialize_new_page();
+    static void validate_tuple_width(std::size_t tuple_width);
     void validate_rid(const RID& rid) const;
     void validate_tuple(const std::vector<std::uint8_t>& tuple) const;
-    std::size_t bitmap_offset(SlotId slot_id) const;
+    std::size_t bitmap_offset(bool deletion_bitmap, SlotId slot_id) const;
     std::uint8_t bitmap_mask(SlotId slot_id) const;
     std::size_t tuple_offset(SlotId slot_id) const;
 
     PageId page_id_;
     std::size_t tuple_size_;
     std::size_t slot_count_;
+    std::size_t allocated_count_;
     Buffer buffer_{};
 };
 
