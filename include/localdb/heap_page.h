@@ -38,9 +38,13 @@ public:
     }
 
     PageId page_id() const noexcept { return page_id_; }
+    std::size_t tuple_width() const noexcept { return tuple_size_; }
+    std::size_t slot_capacity() const noexcept { return slot_count_; }
+    std::size_t allocated_slot_count() const noexcept { return allocated_count_; }
+
+    // Compatibility names retained for the earlier API.
     std::size_t tuple_size() const noexcept { return tuple_size_; }
     std::size_t slot_count() const noexcept { return slot_count_; }
-    std::size_t allocated_slot_count() const noexcept { return allocated_count_; }
     std::size_t free_slot_count() const noexcept;
 
     const Buffer& buffer() const noexcept { return buffer_; }
@@ -48,6 +52,7 @@ public:
     // Returns a new RID, or nullopt if the page is full. The tuple must have
     // exactly tuple_size() bytes.
     std::optional<RID> insert(const std::vector<std::uint8_t>& tuple);
+    std::optional<SlotId> find_free_slot() const;
 
     // Returns nullopt when the slot is valid but currently empty.
     std::optional<std::vector<std::uint8_t>> get(const RID& rid) const;
@@ -57,11 +62,16 @@ public:
     bool erase(const RID& rid);
 
     bool occupied(SlotId slot_id) const;
-    bool allocated(SlotId slot_id) const;
-    bool deleted(SlotId slot_id) const;
+    bool is_allocated(SlotId slot_id) const;
+    bool is_deleted(SlotId slot_id) const;
+
+    // Compatibility names retained for the earlier API.
+    bool allocated(SlotId slot_id) const { return is_allocated(slot_id); }
+    bool deleted(SlotId slot_id) const { return is_deleted(slot_id); }
 
 private:
-    static constexpr std::size_t kHeaderSize = 16;
+    // The first eight bytes are reserved for a future log sequence number.
+    static constexpr std::size_t kHeaderSize = 24;
 
     HeapPage(PageId page_id, std::size_t tuple_size, Buffer buffer,
              std::size_t slot_count, std::size_t allocated_count);
@@ -72,6 +82,9 @@ private:
     static std::size_t calculate_slot_count(std::size_t tuple_width);
 
     static void validate_tuple_width(std::size_t tuple_width);
+    void set_allocation_bit(SlotId slot_id, bool value);
+    void set_deletion_bit(SlotId slot_id, bool value);
+    void set_allocated_count(std::size_t count);
     void validate_rid(const RID& rid) const;
     void validate_tuple(const std::vector<std::uint8_t>& tuple) const;
     std::size_t bitmap_offset(bool deletion_bitmap, SlotId slot_id) const;

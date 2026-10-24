@@ -7,11 +7,12 @@ namespace localdb {
 namespace {
 
 constexpr std::uint8_t kHeapPageMagic[] = {'H', 'P', 'G', '1'};
-constexpr std::size_t kVersionOffset = 4;
-constexpr std::size_t kTupleWidthOffset = 6;
-constexpr std::size_t kSlotCountOffset = 8;
-constexpr std::size_t kAllocatedCountOffset = 10;
-constexpr std::size_t kReservedOffset = 12;
+constexpr std::size_t kMagicOffset = 8;
+constexpr std::size_t kVersionOffset = 12;
+constexpr std::size_t kTupleWidthOffset = 14;
+constexpr std::size_t kSlotCountOffset = 16;
+constexpr std::size_t kAllocatedCountOffset = 18;
+constexpr std::size_t kReservedOffset = 20;
 
 }  // namespace
 
@@ -37,6 +38,63 @@ void HeapPage::validate_tuple_width(std::size_t tuple_width) {
         tuple_width > std::numeric_limits<std::uint16_t>::max()) {
         throw DatabaseError(ErrorCode::InvalidArgument,
                             "Heap-page tuple width must be a positive multiple of eight");
+    }
+}
+
+void HeapPage::set_allocated_count(std::size_t count) {
+    if (count > slot_count_) {
+        throw DatabaseError(ErrorCode::InvalidArgument,
+                            "Allocated-slot count exceeds slot capacity");
+    }
+    std::size_t actual_count = 0;
+    for (std::size_t slot = 0; slot < slot_count_; ++slot) {
+        if (is_allocated(static_cast<SlotId>(slot))) {
+            ++actual_count;
+        }
+    }
+    if (actual_count != count) {
+        throw DatabaseError(ErrorCode::Corruption,
+                            "Allocated-slot count does not match allocation bitmap");
+    }
+    write_u16(buffer_, kAllocatedCountOffset,
+              static_cast<std::uint16_t>(count));
+    allocated_count_ = count;
+}
+
+void HeapPage::set_allocation_bit(SlotId slot_id, bool value) {
+    if (slot_id >= slot_count_) {
+        throw DatabaseError(ErrorCode::InvalidArgument,
+                            "Heap-page slot is out of range");
+    }
+    const bool previous = is_allocated(slot_id);
+    if (previous == value) {
+        return;
+    }
+    if (!value) {
+        throw DatabaseError(ErrorCode::InvalidArgument,
+                            "Allocated heap-page slots cannot be cleared");
+    }
+
+    buffer_[bitmap_offset(false, slot_id)] |= bitmap_mask(slot_id);
+    set_allocated_count(allocated_count_ + 1);
+}
+
+void HeapPage::set_deletion_bit(SlotId slot_id, bool value) {
+    if (slot_id >= slot_count_) {
+        throw DatabaseError(ErrorCode::InvalidArgument,
+                            "Heap-page slot is out of range");
+    }
+    if (value && !is_allocated(slot_id)) {
+        throw DatabaseError(ErrorCode::InvalidArgument,
+                            "An unallocated heap-page slot cannot be deleted");
+    }
+
+    const std::uint8_t mask = bitmap_mask(slot_id);
+    auto& byte = buffer_[bitmap_offset(true, slot_id)];
+    if (value) {
+        byte |= mask;
+    } else {
+        byte &= static_cast<std::uint8_t>(~mask);
     }
 }
 
@@ -79,7 +137,9 @@ void HeapPage::Initialize(Buffer& buffer, std::size_t tuple_width) {
     }
 
     buffer.assign(kPageSize, 0);
-    std::copy(std::begin(kHeapPageMagic), std::end(kHeapPageMagic), buffer.begin());
+    // Bytes 0-7 are the reserved LSN area and remain zero for this project.
+    std::copy(std::begin(kHeapPageMagic), std::end(kHeapPageMagic),
+              buffer.begin() + kMagicOffset);
     write_u16(buffer, kVersionOffset, kFormatVersion);
     write_u16(buffer, kTupleWidthOffset, static_cast<std::uint16_t>(tuple_width));
     write_u16(buffer, kSlotCountOffset, static_cast<std::uint16_t>(slot_count));
@@ -95,7 +155,8 @@ HeapPage HeapPage::Open(PageId page_id, const Buffer& buffer,
         throw DatabaseError(ErrorCode::InvalidArgument,
                             "Heap-page buffer must be exactly 4096 bytes");
     }
-    if (!std::equal(std::begin(kHeapPageMagic), std::end(kHeapPageMagic), buffer.begin())) {
+    if (!std::equal(std::begin(kHeapPageMagic), std::end(kHeapPageMagic),
+                    buffer.begin() + kMagicOffset)) {
         throw DatabaseError(ErrorCode::Corruption, "Heap page has an invalid magic value");
     }
     if (read_u16(buffer, kVersionOffset) != kFormatVersion) {
@@ -191,7 +252,7 @@ std::size_t HeapPage::tuple_offset(SlotId slot_id) const {
            static_cast<std::size_t>(slot_id) * tuple_size_;
 }
 
-bool HeapPage::allocated(SlotId slot_id) const {
+bool HeapPage::is_allocated(SlotId slot_id) const {
     if (slot_id >= slot_count_) {
         throw DatabaseError(ErrorCode::InvalidArgument,
                             "Heap-page slot is out of range");
@@ -199,7 +260,7 @@ bool HeapPage::allocated(SlotId slot_id) const {
     return (buffer_[bitmap_offset(false, slot_id)] & bitmap_mask(slot_id)) != 0;
 }
 
-bool HeapPage::deleted(SlotId slot_id) const {
+bool HeapPage::is_deleted(SlotId slot_id) const {
     if (slot_id >= slot_count_) {
         throw DatabaseError(ErrorCode::InvalidArgument,
                             "Heap-page slot is out of range");
@@ -208,14 +269,14 @@ bool HeapPage::deleted(SlotId slot_id) const {
 }
 
 bool HeapPage::occupied(SlotId slot_id) const {
-    return allocated(slot_id) && !deleted(slot_id);
+    return is_allocated(slot_id) && !is_deleted(slot_id);
 }
 
 std::size_t HeapPage::free_slot_count() const noexcept {
     std::size_t free_slots = 0;
     for (std::size_t slot = 0; slot < slot_count_; ++slot) {
         const auto slot_id = static_cast<SlotId>(slot);
-        if (!allocated(slot_id) || deleted(slot_id)) {
+        if (!is_allocated(slot_id)) {
             ++free_slots;
         }
     }
@@ -224,19 +285,23 @@ std::size_t HeapPage::free_slot_count() const noexcept {
 
 std::optional<RID> HeapPage::insert(const std::vector<std::uint8_t>& tuple) {
     validate_tuple(tuple);
+    const auto free_slot = find_free_slot();
+    if (!free_slot) {
+        return std::nullopt;
+    }
+
+    const SlotId slot_id = *free_slot;
+    std::copy(tuple.begin(), tuple.end(), buffer_.begin() + tuple_offset(slot_id));
+    set_allocation_bit(slot_id, true);
+    set_deletion_bit(slot_id, false);
+    return RID{page_id_, slot_id};
+}
+
+std::optional<SlotId> HeapPage::find_free_slot() const {
     for (std::size_t slot = 0; slot < slot_count_; ++slot) {
         const auto slot_id = static_cast<SlotId>(slot);
-        if (!allocated(slot_id) || deleted(slot_id)) {
-            std::copy(tuple.begin(), tuple.end(), buffer_.begin() + tuple_offset(slot_id));
-            if (!allocated(slot_id)) {
-                buffer_[bitmap_offset(false, slot_id)] |= bitmap_mask(slot_id);
-                ++allocated_count_;
-            }
-            buffer_[bitmap_offset(true, slot_id)] &=
-                static_cast<std::uint8_t>(~bitmap_mask(slot_id));
-            write_u16(buffer_, kAllocatedCountOffset,
-                      static_cast<std::uint16_t>(allocated_count_));
-            return RID{page_id_, slot_id};
+        if (!is_allocated(slot_id)) {
+            return slot_id;
         }
     }
     return std::nullopt;
@@ -266,9 +331,8 @@ bool HeapPage::erase(const RID& rid) {
     if (!occupied(rid.slot_id)) {
         return false;
     }
-    buffer_[bitmap_offset(true, rid.slot_id)] |= bitmap_mask(rid.slot_id);
-    std::fill(buffer_.begin() + tuple_offset(rid.slot_id),
-              buffer_.begin() + tuple_offset(rid.slot_id) + tuple_size_, 0);
+    // Logical deletion preserves both the allocation bit and tuple bytes.
+    set_deletion_bit(rid.slot_id, true);
     return true;
 }
 
